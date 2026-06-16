@@ -15,3 +15,9 @@ update-hermes.sh
 
 # Monetization planning — private, never committed
 monetization/
+
+# Empty placeholder artifact dropped by tooling
+Claude
+
+# Local machine-specific launcher scripts (tied to a local schtask + ports)
+tools/
