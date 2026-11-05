@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, RefreshCw, Sparkles } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { PageHeader } from '@/components/page-header'
@@ -9,33 +9,8 @@ import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { FieldError } from '@/components/ui/field-error'
 import { CardSkeleton } from '@/components/ui/skeleton'
+import { usePremium } from '@/hooks/use-premium'
 import { useI18n } from '@/i18n'
-
-interface LicenseStatus {
-  valid: boolean
-  plan: 'annual' | 'lifetime' | null
-  status: string | null
-  expiresAt: string | null
-  cancelAtPeriodEnd?: boolean
-  reason?: string
-  checkedAtMs: number
-}
-
-interface CatalogSyncState {
-  baseUrl: string
-  appliedVersion: string | null
-  appliedTier: string | null
-  lastSyncMs: number | null
-  lastError: string | null
-}
-
-interface PremiumStatus {
-  hasKey: boolean
-  maskedKey: string | null
-  license: LicenseStatus | null
-  catalog: CatalogSyncState
-  siteUrl: string
-}
 
 function fmtWhen(ms: number | null): string | null {
   if (!ms) return null
@@ -53,15 +28,15 @@ export default function PremiumPage() {
   const [keyInput, setKeyInput] = useState('')
   const [activateAttempted, setActivateAttempted] = useState(false)
 
-  const { data, isLoading } = useQuery<PremiumStatus>({
-    queryKey: ['premium'],
-    queryFn: () => apiFetch('/api/premium'),
-  })
+  const { data, isLoading, licensed } = usePremium()
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['premium'] })
-    // A sync may have changed the model list and quirks.
-    queryClient.invalidateQueries({ queryKey: ['models'] })
+    // A sync may have changed every model list (chat, embeddings, media,
+    // search) and quirks, not just ['models'].
+    for (const queryKey of [['models'], ['fallback'], ['embeddings'], ['media'], ['search-engines']]) {
+      queryClient.invalidateQueries({ queryKey })
+    }
   }
 
   const activate = useMutation({
@@ -106,8 +81,6 @@ export default function PremiumPage() {
 
   const { hasKey, maskedKey, license, catalog, siteUrl } = data
   const live = catalog.appliedTier === 'live'
-  const licensed = hasKey && license?.valid
-
   return (
     <div>
       <PageHeader

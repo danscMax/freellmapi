@@ -136,40 +136,56 @@ describe('Router', () => {
     expect(large.modelDbId).not.toBe(baseline.modelDbId);
   });
 
-  it('skips GitHub GPT-4.1 above its free-tier 8K request cap (#426)', () => {
+  it('prefers margin-fitting models but still serves raw-window fits (#956 review)', () => {
     const db = getDb();
-    const githubKey = encrypt('test-github-key');
-    db.prepare(`
-      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run('github', 'github', githubKey.encrypted, githubKey.iv, githubKey.authTag, 'healthy', 1);
     const groqKey = encrypt('test-groq-key');
     db.prepare(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run('groq', 'groq', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
 
-    const github = db.prepare(`
-      SELECT id, context_window FROM models
-       WHERE platform = 'github' AND model_id = 'openai/gpt-4.1'
-    `).get() as { id: number; context_window: number };
     const groq = db.prepare(`
       SELECT id FROM models
-       WHERE platform = 'groq' AND context_window > 9000
+       WHERE platform = 'groq' AND context_window = 131072
        LIMIT 1
     `).get() as { id: number };
 
     db.prepare('UPDATE fallback_config SET priority = 1000, enabled = 1').run();
-    db.prepare('UPDATE fallback_config SET priority = 1 WHERE model_db_id = ?').run(github.id);
-    db.prepare('UPDATE fallback_config SET priority = 2 WHERE model_db_id = ?').run(groq.id);
-    db.prepare(`
-      UPDATE models SET tpm_limit = NULL, tpd_limit = NULL
-       WHERE id IN (?, ?)
-    `).run(github.id, groq.id);
+    db.prepare('UPDATE fallback_config SET priority = 1 WHERE model_db_id = ?').run(groq.id);
+    db.prepare('UPDATE models SET tpm_limit = NULL, tpd_limit = NULL WHERE id = ?').run(groq.id);
 
-    expect(github.context_window).toBe(8000);
-    expect(routeRequest(7000).modelDbId).toBe(github.id);
-    expect(routeRequest(9000).modelDbId).toBe(groq.id);
+    // CONTEXT_WINDOW_SAFETY_FACTOR: the chars/4 estimate under-counts dense
+    // payloads (JSON, code), so the preferred ceiling is window / 1.25.
+    // 131072 / 1.25 = 104857.6. A margin-fitting runner-up on another platform
+    // must NOT outrank the priority-1 model while the estimate is inside the
+    // margin.
+    const googleKey = encrypt('test-google-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('google', 'google', googleKey.encrypted, googleKey.iv, googleKey.authTag, 'healthy', 1);
+    const google = db.prepare(`
+      SELECT id FROM models
+       WHERE platform = 'google' AND context_window >= 132500 AND enabled = 1
+       ORDER BY intelligence_rank ASC
+       LIMIT 1
+    `).get() as { id: number };
+    expect(google).toBeDefined();
+    db.prepare('UPDATE fallback_config SET priority = 2 WHERE model_db_id = ?').run(google.id);
+    db.prepare('UPDATE models SET tpm_limit = NULL, tpd_limit = NULL WHERE id = ?').run(google.id);
+
+    expect(routeRequest(104000).modelDbId).toBe(groq.id);
+
+    // Above the margin ceiling the priority-1 model is DEMOTED, not excluded:
+    // /v1/models advertises the raw window, so a client that packs past the
+    // margin gets the margin-fitting runner-up instead of "all models exhausted".
+    expect(routeRequest(106000).modelDbId).not.toBe(groq.id);
+    expect(routeRequest(106000).modelDbId).toBe(google.id);
+
+    // When nothing fits WITH the margin anywhere, the raw advertised window is
+    // still honored — one attempt rather than an empty pool.
+    db.prepare("DELETE FROM api_keys WHERE platform = 'google'").run();
+    expect(routeRequest(106000).modelDbId).toBe(groq.id);
   });
 
   it('still routes a model with an unknown (null) context window (#167)', () => {
@@ -220,6 +236,70 @@ describe('Router', () => {
       count: 2,
       penalty: 3,
     });
+  });
+});
+
+describe('Router explicit pin vs upstream retirement (#1394)', () => {
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+  });
+
+  beforeEach(() => {
+    const db = getDb();
+    setRoutingStrategy('priority');
+    db.prepare('DELETE FROM api_keys').run();
+    db.prepare("DELETE FROM settings WHERE key = 'active_profile_id'").run();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('does not inject a pinned model carrying an upstream_eol tombstone into the chain', () => {
+    const db = getDb();
+    const { encrypted, iv, authTag } = encrypt('test-groq-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('groq', 'test', encrypted, iv, authTag, 'healthy', 1);
+
+    // Retire a groq model upstream: chain off + tombstone, row stays enabled=1
+    // (the documented retirement contract).
+    const target = db.prepare(
+      "SELECT id, model_id FROM models WHERE platform = 'groq' AND enabled = 1 ORDER BY intelligence_rank ASC LIMIT 1",
+    ).get() as { id: number; model_id: string };
+    db.prepare('UPDATE fallback_config SET enabled = 0 WHERE model_db_id = ?').run(target.id);
+    db.prepare(`
+      INSERT INTO catalog_model_tombstones (kind, platform, model_id, source, reason, created_at)
+      VALUES ('chat', 'groq', ?, 'upstream_eol', 'HTTP 410 end of life', datetime('now'))
+    `).run(target.model_id);
+
+    // The pin must not re-add it: the request routes to some OTHER groq model,
+    // never to the retired one.
+    const result = routeRequest(1000, undefined, target.id);
+    expect(result.modelDbId).not.toBe(target.id);
+  });
+
+  it('still pins a model whose tombstone is from the user, not upstream', () => {
+    const db = getDb();
+    const { encrypted, iv, authTag } = encrypt('test-groq-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('groq', 'test', encrypted, iv, authTag, 'healthy', 1);
+
+    const target = db.prepare(
+      "SELECT id, model_id FROM models WHERE platform = 'groq' AND enabled = 1 ORDER BY intelligence_rank DESC LIMIT 1",
+    ).get() as { id: number; model_id: string };
+    db.prepare('UPDATE fallback_config SET enabled = 0 WHERE model_db_id = ?').run(target.id);
+    db.prepare(`
+      INSERT INTO catalog_model_tombstones (kind, platform, model_id, source, reason, created_at)
+      VALUES ('chat', 'groq', ?, 'user', 'removed in dashboard', datetime('now'))
+    `).run(target.model_id);
+
+    const result = routeRequest(1000, undefined, target.id);
+    expect(result.modelDbId).toBe(target.id);
   });
 });
 

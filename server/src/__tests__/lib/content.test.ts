@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { contentToString, flattenMessageContent, messageHasImage, normalizeOutboundContent, sanitizeResponse } from '../../lib/content.js';
+import { contentToString, estimateInputTokens, flattenMessageContent, messageHasImage, normalizeOutboundContent, sanitizeResponse, stripImagesFromMessages } from '../../lib/content.js';
+import type { ChatMessage } from '@freellmapi/shared/types.js';
 
 describe('contentToString', () => {
   it('passes strings through', () => {
@@ -93,6 +94,35 @@ describe('messageHasImage', () => {
   });
 });
 
+describe('stripImagesFromMessages', () => {
+  it('drops image blocks but keeps text blocks', () => {
+    const out = stripImagesFromMessages([
+      { role: 'user', content: [
+        { type: 'text', text: 'hello' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+      ] },
+    ]);
+    expect(out[0].content).toEqual([{ type: 'text', text: 'hello' }]);
+  });
+
+  it('replaces an image-only message with an empty string', () => {
+    const out = stripImagesFromMessages([
+      { role: 'user', content: [
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+      ] },
+    ]);
+    expect(out[0].content).toBe('');
+  });
+
+  it('leaves string content and plain messages untouched', () => {
+    const m1 = { role: 'user', content: 'plain text' };
+    const m2 = { role: 'assistant', content: null };
+    const out = stripImagesFromMessages([m1 as any, m2 as any]);
+    expect(out[0]).toBe(m1);  // identity preserved (no unnecessary copy)
+    expect(out[1]).toBe(m2);
+  });
+});
+
 describe('normalizeOutboundContent (#166)', () => {
   it('coerces array delta.content to a string on streaming chunks', () => {
     const chunk = { choices: [{ index: 0, delta: { content: [{ type: 'text', text: 'hel' }, { type: 'text', text: 'lo' }] } }] };
@@ -171,5 +201,31 @@ describe('sanitizeResponse', () => {
     expect(() => sanitizeResponse({ usage: { prompt_tokens: 1 } })).not.toThrow();
     expect(() => sanitizeResponse(null as unknown)).not.toThrow();
     expect(() => sanitizeResponse({} as unknown)).not.toThrow();
+  });
+});
+
+describe('estimateInputTokens', () => {
+  const messages: ChatMessage[] = [{ role: 'user', content: 'x'.repeat(400) }];
+
+  it('counts message text at ~4 chars per token', () => {
+    expect(estimateInputTokens(messages)).toBe(100);
+  });
+
+  it('counts the tool schemas the request carries', () => {
+    // Claude Code ships ~65 KB of tool schemas next to a few KB of messages;
+    // an estimate without them routed its turns to models they could not fit.
+    const tools = [{ type: 'function', function: { name: 'Read', description: 'd'.repeat(4000), parameters: { type: 'object' } } }];
+    const withTools = estimateInputTokens(messages, tools);
+    expect(withTools).toBeGreaterThan(100 + 1000);
+    expect(estimateInputTokens(messages, [])).toBe(100);
+  });
+
+  it('counts assistant tool-call arguments', () => {
+    const withCall: ChatMessage[] = [...messages, {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{ id: 'c1', type: 'function', function: { name: 'Write', arguments: 'a'.repeat(795) } }],
+    } as ChatMessage];
+    expect(estimateInputTokens(withCall)).toBe(100 + 200);
   });
 });

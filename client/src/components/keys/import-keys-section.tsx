@@ -10,12 +10,13 @@ import type { ImportKey, ImportSelectedResponse, Platform, PreviewKey, PreviewRe
 import { Upload } from 'lucide-react'
 import { useI18n } from '@/i18n'
 import { toast } from '@/lib/toast'
-import { PLATFORMS } from './shared'
+import { CUSTOM_GROUP, LISTED_PLATFORMS } from './shared'
 
 interface ImportRow extends PreviewKey {
   selected: boolean
   platform: Platform | ''
   visible: boolean
+  isDuplicate: boolean
 }
 
 // Always rendered inside the Add key dialog: no outer section chrome/heading.
@@ -28,9 +29,17 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
   const [rows, setRows] = useState<ImportRow[]>([])
   const [skipped, setSkipped] = useState<string[]>([])
 
-  const importablePlatforms = PLATFORMS.filter(p => !p.keyless)
+  // 'custom' is not one of PLATFORMS — it is configured through its own form,
+  // so it is deliberately absent from the generic provider dropdown. An
+  // imported row is the one case where it belongs there: the file already
+  // names the endpoint, and without the option the row can never be selected
+  // and the endpoint can never be restored (#687).
+  const importablePlatforms = [...LISTED_PLATFORMS.filter(p => !p.keyless), CUSTOM_GROUP]
 
   function platformFromPreview(key: PreviewKey): Platform | '' {
+    // A custom row is only importable with its base URL; there is nowhere to
+    // route it otherwise.
+    if (key.detectedPlatform === 'custom') return key.baseUrl ? 'custom' : ''
     return importablePlatforms.some(p => p.value === key.detectedPlatform)
       ? key.detectedPlatform as Platform
       : ''
@@ -49,8 +58,9 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
         return {
           ...key,
           platform: detected,
-          selected: detected !== '',
+          selected: detected !== '' && !key.isDuplicate,
           visible: false,
+          isDuplicate: key.isDuplicate ?? false,
         }
       }))
       setSkipped(data.skipped)
@@ -68,10 +78,13 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
       queryClient.invalidateQueries({ queryKey: ['keys'] })
       queryClient.invalidateQueries({ queryKey: ['health'] })
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      queryClient.invalidateQueries({ queryKey: ['keys-providers'] })
       // The dialog closes on success, so surface the imported/failed counts as
       // a toast.
       if (onImported) {
-        toast.success(t('keys.importResult', { imported: data.imported, failed: data.errors.length }))
+        toast.success((data.modelsRegistered ?? 0) > 0
+          ? t('keys.importResultWithModels', { imported: data.imported, models: data.modelsRegistered, failed: data.errors.length })
+          : t('keys.importResult', { imported: data.imported, failed: data.errors.length }))
         onImported()
       }
     },
@@ -83,6 +96,8 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
       keyName: row.keyName,
       keyValue: row.keyValue,
       platform: row.platform,
+      ...(row.baseUrl ? { baseUrl: row.baseUrl } : {}),
+      ...(row.models?.length ? { models: row.models } : {}),
     }))
 
   function updateRow(index: number, patch: Partial<ImportRow>) {
@@ -119,7 +134,7 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
             <Input
               type="file"
               multiple
-              accept=".env,.json,.jsonc,.md,.txt"
+              accept=".env,.json,.jsonc,.md,.txt,.csv"
               onChange={chooseFiles}
               className="cursor-pointer text-xs file:mr-2"
             />
@@ -148,11 +163,12 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
               </TableHeader>
               <TableBody>
                 {rows.map((row, index) => (
-                  <TableRow key={`${row.keyName}:${index}`}>
+                  <TableRow key={`${row.keyName}:${index}`} className={row.isDuplicate ? 'bg-muted/50' : ''}>
                     <TableCell>
                       <input
                         type="checkbox"
                         checked={row.selected}
+                        disabled={row.isDuplicate}
                         onChange={() => updateRow(index, { selected: !row.selected })}
                         className="size-4 accent-primary"
                       />
@@ -173,11 +189,23 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
                       </Select>
                     </TableCell>
                     <TableCell>
-                      <Input
-                        value={row.keyName}
-                        onChange={e => updateRow(index, { keyName: e.target.value })}
-                        className="w-[220px] font-mono text-xs"
-                      />
+                      <div className="flex items-center gap-2">
+                        <Input
+                          value={row.keyName}
+                          onChange={e => updateRow(index, { keyName: e.target.value })}
+                          className="w-[220px] font-mono text-xs"
+                        />
+                        {row.isDuplicate && (
+                          <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                            {t('keys.duplicate')}
+                          </span>
+                        )}
+                        {(row.models?.length ?? 0) > 0 && (
+                          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                            {t('keys.importModelCount', { count: row.models!.length })}
+                          </span>
+                        )}
+                      </div>
                     </TableCell>
                     <TableCell>
                       <div className="flex min-w-[280px] items-center gap-2">
@@ -218,6 +246,11 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
 
         {rows.length > 0 && (
           <div className="mt-4 flex flex-wrap items-center gap-3">
+            {rows.some(r => r.isDuplicate) && (
+              <span className="text-xs text-amber-600 dark:text-amber-400">
+                {t('keys.duplicatesFound', { count: rows.filter(r => r.isDuplicate).length })}
+              </span>
+            )}
             <Button
               type="button"
               size="sm"

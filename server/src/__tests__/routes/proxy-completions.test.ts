@@ -6,7 +6,8 @@ import { encrypt } from '../../lib/crypto.js';
 import { setRoutingStrategy } from '../../services/router.js';
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
@@ -111,6 +112,48 @@ describe('POST /v1/completions', () => {
     expect(capturedBody.messages[0].role).toBe('system');
     expect(capturedBody.messages[1].content).toContain('const answer');
     expect(capturedBody.messages[1].content).toContain('console.log(answer);');
+  });
+
+  it('answers with an estimated usage block when the provider omits usage', async () => {
+    // The OpenAI completions shape requires `usage`; free-tier providers that
+    // drop it used to surface as `usage: undefined` on /v1/completions even
+    // though the chars/4 fallback (#764) was already computed.
+    const origFetch = global.fetch;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        return {
+          ok: true,
+          headers: new Headers(),
+          json: () => Promise.resolve({
+            id: 'chatcmpl-nousage',
+            object: 'chat.completion',
+            created: 123,
+            model: JSON.parse(String(init?.body)).model,
+            choices: [{
+              index: 0,
+              message: { role: 'assistant', content: ' = 42;' },
+              finish_reason: 'stop',
+            }],
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/completions', {
+      model: 'auto',
+      prompt: 'const answer',
+      max_tokens: 12,
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(body.usage).not.toBeNull();
+    expect(body.usage).toMatchObject({ estimated: true });
+    expect(body.usage.prompt_tokens).toBeGreaterThan(0);
+    expect(body.usage.completion_tokens).toBe(2); // ceil(' = 42;'.length / 4)
+    expect(body.usage.total_tokens).toBe(body.usage.prompt_tokens + body.usage.completion_tokens);
   });
 
   it('accepts autocomplete clients that send many stop sequences and forwards a provider-safe subset', async () => {

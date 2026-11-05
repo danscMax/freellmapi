@@ -3,9 +3,13 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   AudioLines,
+  Bot,
   Boxes,
   ChartColumn,
+  Clapperboard,
   Copy,
+  Globe,
+  Scale,
   Image as ImageIcon,
   KeyRound,
   Layers,
@@ -17,17 +21,13 @@ import {
   Zap,
 } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import { toast } from '@/lib/toast'
 import { apiBaseUrl } from '@/components/api-usage'
+import { COMMAND_PALETTE_EVENT } from '@/components/command-palette-state'
 import { useI18n } from '@/i18n'
 import type { FallbackEntry } from '@/lib/routing'
-
-// Open the palette from anywhere (navbar button); same custom-event idiom as
-// UNAUTHORIZED_EVENT in lib/api.ts.
-export const COMMAND_PALETTE_EVENT = 'freellmapi:command-palette'
-export function openCommandPalette() {
-  window.dispatchEvent(new CustomEvent(COMMAND_PALETTE_EVENT))
-}
+import { useTheme } from '@/theme-context'
 
 interface Command {
   id: string
@@ -38,11 +38,20 @@ interface Command {
   run: () => void
 }
 
+// Copy and report what actually happened: on an insecure origin (a plain-HTTP
+// LAN install) the copy can fail, and a success toast over an empty clipboard
+// is worse than no toast at all (#734).
+async function copyAndToast(value: string, success: string, failure: string) {
+  if (await copyText(value)) toast.success(success)
+  else toast.error(failure)
+}
+
 // Cmd+K / Ctrl+K palette: jump to any page or model, toggle theme, copy the
 // unified key or base URL. Zero-dep overlay; list is keyboard-driven
 // (arrows + Enter) with proper listbox semantics.
 export function CommandPalette() {
   const { t } = useI18n()
+  const { resolvedDark, setTheme } = useTheme()
   const navigate = useNavigate()
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -100,12 +109,16 @@ export function CommandPalette() {
     const go = (to: string) => () => navigate(to)
     const pages: Command[] = [
       { id: 'p-chat', group: 'pages', label: t('models.chatModelsTab'), keywords: 'models chat routing fallback', icon: MessageSquare, run: go('/models/chat') },
-      { id: 'p-embeddings', group: 'pages', label: t('models.embeddingsTab'), keywords: 'models embeddings vectors', icon: Layers, run: go('/models/embeddings') },
       { id: 'p-image', group: 'pages', label: t('models.imageTab'), keywords: 'models image generation', icon: ImageIcon, run: go('/models/image') },
-      { id: 'p-audio', group: 'pages', label: t('models.audioTab'), keywords: 'models audio speech tts', icon: AudioLines, run: go('/models/audio') },
+      { id: 'p-video', group: 'pages', label: t('models.videoTab'), keywords: 'models video text to video generation mp4', icon: Clapperboard, run: go('/models/video') },
+      { id: 'p-audio', group: 'pages', label: t('models.audioTab'), keywords: 'models audio speech tts stt transcription whisper', icon: AudioLines, run: go('/models/audio') },
+      { id: 'p-embeddings', group: 'pages', label: t('models.embeddingsTab'), keywords: 'models embeddings vectors', icon: Layers, run: go('/models/embeddings') },
+      { id: 'p-decision', group: 'pages', label: t('decision.tab'), keywords: 'models decision classify choice yes no score clef mercury', icon: Scale, run: go('/models/decision') },
+      { id: 'p-search', group: 'pages', label: t('search.tab'), keywords: 'models search web tavily exa firecrawl linkup parallel keenable', icon: Globe, run: go('/models/search') },
       { id: 'p-fusion', group: 'pages', label: t('models.fusionTab'), keywords: 'models fusion synthesis panel judge', icon: Zap, run: go('/models/fusion') },
       { id: 'p-playground', group: 'pages', label: t('nav.playground'), keywords: 'playground test chat try', icon: SquareTerminal, run: go('/playground') },
       { id: 'p-keys', group: 'pages', label: t('nav.keys'), keywords: 'keys providers api tokens', icon: KeyRound, run: go('/keys') },
+      { id: 'p-agents', group: 'pages', label: t('nav.agents'), keywords: 'agents claude codex cline ollama gemini', icon: Bot, run: go('/agents') },
       { id: 'p-analytics', group: 'pages', label: t('nav.analytics'), keywords: 'analytics usage stats savings latency', icon: ChartColumn, run: go('/analytics') },
       { id: 'p-premium', group: 'pages', label: t('nav.premium'), keywords: 'premium catalog license subscription', icon: Sparkles, run: go('/premium') },
     ]
@@ -117,9 +130,7 @@ export function CommandPalette() {
         keywords: 'theme dark light mode toggle',
         icon: Moon,
         run: () => {
-          const next = !document.documentElement.classList.contains('dark')
-          document.documentElement.classList.toggle('dark', next)
-          try { localStorage.setItem('theme', next ? 'dark' : 'light') } catch { /* ignore */ }
+          setTheme(resolvedDark ? 'light' : 'dark')
         },
       },
       {
@@ -130,8 +141,7 @@ export function CommandPalette() {
         icon: Copy,
         run: () => {
           if (!keyData?.apiKey) return
-          void navigator.clipboard?.writeText(keyData.apiKey)
-          toast.success(t('setup.copiedKey'))
+          void copyAndToast(keyData.apiKey, t('setup.copiedKey'), t('common.copyFailed'))
         },
       },
       {
@@ -141,8 +151,7 @@ export function CommandPalette() {
         keywords: 'copy base url endpoint',
         icon: Copy,
         run: () => {
-          void navigator.clipboard?.writeText(apiBaseUrl())
-          toast.success(t('setup.copiedUrl'))
+          void copyAndToast(apiBaseUrl(), t('setup.copiedUrl'), t('common.copyFailed'))
         },
       },
     ]
@@ -165,7 +174,7 @@ export function CommandPalette() {
       })
     }
     return [...pages, ...actions, ...models]
-  }, [entries, keyData, navigate, t])
+  }, [entries, keyData, navigate, resolvedDark, setTheme, t])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()

@@ -1,9 +1,51 @@
 import crypto from 'crypto';
-import Database from 'better-sqlite3';
+import type { Db } from '../types.js';
+
 import { initEncryptionKey } from '../../lib/crypto.js';
 import { applyModelPricing } from '../model-pricing.js';
 
-export function up(db: Database.Database): void {
+/**
+ * Rename a model id, collision-safely (#1603).
+ *
+ * Every rename in this file is an in-place UPDATE of `model_id`, and the
+ * baseline can legitimately run against a DB whose `models` rows were written
+ * by an older code path (a pre-migrator install that gets adopted, a restore
+ * whose `migrations` table predates a rename, a catalog-sync that already
+ * carried the new id). When the target (platform, model_id) row ALREADY
+ * exists, a bare UPDATE used to die with `UNIQUE constraint failed:
+ * models.platform, models.models_id` and boot crashed (#1603).
+ *
+ * The merge rule is: the existing target row wins (it is the fresher identity,
+ * often catalog-sync-owned and already in the fallback chain); the stale old
+ * row loses its chain entry and is deleted. This makes every rename idempotent:
+ * a second pass finds no old row and no-ops.
+ */
+function renameModel(
+  db: Db,
+  platform: string,
+  fromModelId: string,
+  toModelId: string,
+  apply: (db: Db) => void,
+): void {
+  const src = db
+    .prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?')
+    .get(platform, fromModelId) as { id: number } | undefined;
+  if (!src) return;
+  const dst = db
+    .prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?')
+    .get(platform, toModelId) as { id: number } | undefined;
+  if (dst) {
+    // The rename already happened once (or the catalog shipped the new id
+    // first). Drop the stale row rather than crash on the UNIQUE index.
+    db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(src.id);
+    db.prepare('DELETE FROM profile_models WHERE model_db_id = ?').run(src.id);
+    db.prepare('DELETE FROM models WHERE id = ?').run(src.id);
+    return;
+  }
+  apply(db);
+}
+
+export function up(db: Db): void {
   createTables(db);
   initEncryptionKey(db);
   seedModels(db);
@@ -50,11 +92,11 @@ export function up(db: Database.Database): void {
   migrateProfilesInit(db);
 }
 
-export function down(_db: Database.Database): void {
+export function down(_db: Db): void {
   throw new Error('Legacy baseline is irreversible - restore from backup');
 }
 
-function createTables(db: Database.Database) {
+function createTables(db: Db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS models (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,7 +276,7 @@ function createTables(db: Database.Database) {
 // NULL when the request was auto-routed ('auto' or omitted model field).
 // requested_model = model_id means the pin was honored; a different model_id
 // means rate limits or failures forced a failover to another model.
-function ensureRequestRequestedModelColumn(db: Database.Database) {
+function ensureRequestRequestedModelColumn(db: Db) {
   const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'requested_model')) {
     db.prepare('ALTER TABLE requests ADD COLUMN requested_model TEXT').run();
@@ -244,14 +286,14 @@ function ensureRequestRequestedModelColumn(db: Database.Database) {
 // `ttfb_ms` is the time-to-first-byte for streaming responses (ms from dispatch
 // to the first chunk). NULL for non-streaming or pre-existing rows. Feeds the
 // bandit router's latency axis (server/src/services/scoring.ts).
-function ensureRequestTtfbColumn(db: Database.Database) {
+function ensureRequestTtfbColumn(db: Db) {
   const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'ttfb_ms')) {
     db.prepare('ALTER TABLE requests ADD COLUMN ttfb_ms INTEGER').run();
   }
 }
 
-function ensureRequestKeyIdColumn(db: Database.Database) {
+function ensureRequestKeyIdColumn(db: Db) {
   const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'key_id')) {
     db.prepare('ALTER TABLE requests ADD COLUMN key_id INTEGER').run();
@@ -261,7 +303,7 @@ function ensureRequestKeyIdColumn(db: Database.Database) {
 
 // `base_url` is the upstream endpoint for the user-configured 'custom' provider
 // (#117). NULL for every built-in platform — they use their hardcoded base URL.
-function ensureApiKeysBaseUrlColumn(db: Database.Database) {
+function ensureApiKeysBaseUrlColumn(db: Db) {
   const columns = db.prepare('PRAGMA table_info(api_keys)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'base_url')) {
     db.prepare('ALTER TABLE api_keys ADD COLUMN base_url TEXT').run();
@@ -271,7 +313,7 @@ function ensureApiKeysBaseUrlColumn(db: Database.Database) {
 // `key_id` binds a custom model to the api_keys row that carries ITS endpoint,
 // so several custom providers can coexist (#212). NULL for built-in platforms
 // (any key of the platform serves any of its models).
-function ensureModelsKeyIdColumn(db: Database.Database) {
+function ensureModelsKeyIdColumn(db: Db) {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'key_id')) {
     db.prepare('ALTER TABLE models ADD COLUMN key_id INTEGER').run();
@@ -285,7 +327,7 @@ function ensureModelsKeyIdColumn(db: Database.Database) {
   }
 }
 
-function seedModels(db: Database.Database) {
+function seedModels(db: Db) {
   const count = db.prepare('SELECT COUNT(*) as cnt FROM models').get() as { cnt: number };
   if (count.cnt > 0) return;
 
@@ -360,23 +402,32 @@ function seedModels(db: Database.Database) {
  * corrects stale rate-limits / monthly budgets, adds new smarter models
  * and three new providers (Zhipu, Moonshot, MiniMax).
  */
-function migrateModels(db: Database.Database) {
+function migrateModels(db: Db) {
   // 1) Replace outdated models in-place (preserves fallback_config & any references)
-  const renames: Array<[string, string, string, string, number, string, number | null, number | null, number]> = [
-    // platform, oldModelId, newModelId, newDisplayName, intelligenceRank, monthlyBudget, rpdLimit, contextWindow, sizeLabelPriority(unused)
-  ];
-  const renameStmt = db.prepare(`
-    UPDATE models
-       SET model_id = ?, display_name = ?, intelligence_rank = ?,
-           monthly_token_budget = ?, rpd_limit = COALESCE(?, rpd_limit),
-           context_window = COALESCE(?, context_window),
-           size_label = COALESCE(?, size_label)
-     WHERE platform = ? AND model_id = ?
-  `);
+  const rename = (platform: string, from: string, to: string, apply: (db: Db) => void) =>
+    renameModel(db, platform, from, to, apply);
   // DeepSeek R1 (free) -> DeepSeek V3.1 (free)
-  renameStmt.run('deepseek/deepseek-v3.1:free', 'DeepSeek V3.1 (free)', 2, '~6M', 200, 131072, 'Frontier', 'openrouter', 'deepseek/deepseek-r1:free');
+  rename('openrouter', 'deepseek/deepseek-r1:free', 'deepseek/deepseek-v3.1:free', (d) => {
+    d.prepare(`
+      UPDATE models
+         SET model_id = 'deepseek/deepseek-v3.1:free', display_name = 'DeepSeek V3.1 (free)', intelligence_rank = 2,
+             monthly_token_budget = '~6M', rpd_limit = COALESCE(200, rpd_limit),
+             context_window = COALESCE(131072, context_window),
+             size_label = COALESCE('Frontier', size_label)
+       WHERE platform = 'openrouter' AND model_id = 'deepseek/deepseek-r1:free'
+    `).run();
+  });
   // GitHub GPT-4o -> GPT-5
-  renameStmt.run('openai/gpt-5', 'GPT-5 (GitHub)', 1, '~18M', null, 128000, 'Frontier', 'github', 'gpt-4o');
+  rename('github', 'gpt-4o', 'openai/gpt-5', (d) => {
+    d.prepare(`
+      UPDATE models
+         SET model_id = 'openai/gpt-5', display_name = 'GPT-5 (GitHub)', intelligence_rank = 1,
+             monthly_token_budget = '~18M',
+             context_window = COALESCE(128000, context_window),
+             size_label = COALESCE('Frontier', size_label)
+       WHERE platform = 'github' AND model_id = 'gpt-4o'
+    `).run();
+  });
 
   // 2) Correct stale limits / budgets on existing rows
   db.prepare(`UPDATE models SET rpd_limit = 20, monthly_token_budget = '~3M' WHERE platform = 'google' AND model_id = 'gemini-2.5-flash'`).run();
@@ -439,7 +490,7 @@ function migrateModels(db: Database.Database) {
  * the current free tier, and adds real :free OpenRouter models found in the
  * live catalog (April 2026).
  */
-function migrateModelsV2(db: Database.Database) {
+function migrateModelsV2(db: Db) {
   // Helper: delete a model and its fallback_config entry (FK is RESTRICT-by-default)
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
@@ -468,18 +519,18 @@ function migrateModelsV2(db: Database.Database) {
 
   // GitHub: gpt-5 is in the model catalog but returns "unavailable_model" on free tier
   // inference. Revert to gpt-4o which works. This only runs if the gpt-5 row exists.
-  db.prepare(`
+  renameModel(db, 'github', 'openai/gpt-5', 'gpt-4o', (d) => d.prepare(`
     UPDATE models
        SET model_id = 'gpt-4o', display_name = 'GPT-4o', intelligence_rank = 5,
            size_label = 'Large', context_window = 8000, monthly_token_budget = '~18M'
      WHERE platform = 'github' AND model_id = 'openai/gpt-5'
-  `).run();
+  `).run());
 
   // Groq: scout requires the meta-llama/ publisher prefix
-  db.prepare(`
+  renameModel(db, 'groq', 'llama-4-scout-17b-16e-instruct', 'meta-llama/llama-4-scout-17b-16e-instruct', (d) => d.prepare(`
     UPDATE models SET model_id = 'meta-llama/llama-4-scout-17b-16e-instruct'
      WHERE platform = 'groq' AND model_id = 'llama-4-scout-17b-16e-instruct'
-  `).run();
+  `).run());
 
   // Add real OpenRouter :free models that exist in the live catalog
   const insert = db.prepare(`
@@ -515,7 +566,7 @@ function migrateModelsV2(db: Database.Database) {
  * SWE-bench Verified, Terminal-Bench 2, TAU-Bench, Aider Polyglot.
  * Higher rank = weaker. Ties are allowed (same weights across providers).
  */
-function migrateModelsV3Ranks(db: Database.Database) {
+function migrateModelsV3Ranks(db: Db) {
   const setRank = db.prepare(`UPDATE models SET intelligence_rank = ? WHERE platform = ? AND model_id = ?`);
   const ranks: Array<[number, string, string]> = [
     // #1-10 frontier coders / agents
@@ -570,7 +621,7 @@ function migrateModelsV3Ranks(db: Database.Database) {
  * (no structured tools), OR/gemma-4 (weak at tools). Renames CF llama-3.1 → 3.3
  * fp8-fast. Corrects stale limits.
  */
-function migrateModelsV4(db: Database.Database) {
+function migrateModelsV4(db: Db) {
   // 1) Remove entries that are unavailable or fail agentic tool use
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
@@ -593,13 +644,13 @@ function migrateModelsV4(db: Database.Database) {
   applyRemovals();
 
   // 2) Cloudflare: replace Llama 3.1 70B with the current-gen 3.3 70B fp8-fast
-  db.prepare(`
+  renameModel(db, 'cloudflare', '@cf/meta/llama-3.1-70b-instruct', '@cf/meta/llama-3.3-70b-instruct-fp8-fast', (d) => d.prepare(`
     UPDATE models
        SET model_id = '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
            display_name = 'Llama 3.3 70B fp8-fast (CF)',
            context_window = 131072
      WHERE platform = 'cloudflare' AND model_id = '@cf/meta/llama-3.1-70b-instruct'
-  `).run();
+  `).run());
 
   // 3) Field corrections verified via primary sources + live probe
   db.prepare(`UPDATE models SET tpm_limit = 12000 WHERE platform = 'groq' AND model_id = 'llama-3.3-70b-versatile'`).run();
@@ -725,7 +776,7 @@ function migrateModelsV4(db: Database.Database) {
  * free tier but throttled to 10 RPM / 100 RPD due to high demand; context capped
  * at 8192 on free tier).
  */
-function migrateModelsV5(db: Database.Database) {
+function migrateModelsV5(db: Db) {
   db.prepare(`UPDATE models SET enabled = 0 WHERE platform = 'google' AND model_id = 'gemini-2.5-pro'`).run();
 
   const insert = db.prepare(`
@@ -766,7 +817,7 @@ function migrateModelsV5(db: Database.Database) {
  *     against the same 20 RPD pool, confirming free-tier eligibility)
  *   - 2 OpenRouter :free models with no expiration_date
  */
-function migrateModelsV6(db: Database.Database) {
+function migrateModelsV6(db: Db) {
   // 1) Remove confirmed-dead OR route
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
@@ -844,7 +895,7 @@ function migrateModelsV6(db: Database.Database) {
  *   api.z.ai and open.bigmodel.cn keys.
  * HF and NVIDIA left as-is: HF still serves chat with current key; NVIDIA already disabled.
  */
-function migrateModelsV7(db: Database.Database) {
+function migrateModelsV7(db: Db) {
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
     DELETE FROM fallback_config WHERE model_db_id IN (
@@ -903,7 +954,7 @@ function migrateModelsV7(db: Database.Database) {
  * "Couldn't find valid service tier", so the 200s on these rows confirm free-tier
  * access. Cloudflare's @cf/* models share the 10K Neurons/day free pool.
  */
-function migrateModelsV8(db: Database.Database) {
+function migrateModelsV8(db: Db) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -940,7 +991,7 @@ function migrateModelsV8(db: Database.Database) {
  * zai-glm-4.7 due to high demand. Row kept (not deleted) so it can be
  * re-enabled later without losing fallback_config history.
  */
-function migrateModelsV9(db: Database.Database) {
+function migrateModelsV9(db: Db) {
   db.prepare(
     "UPDATE models SET enabled = 0 WHERE platform = 'cerebras' AND model_id = 'zai-glm-4.7'"
   ).run();
@@ -960,7 +1011,7 @@ function migrateModelsV9(db: Database.Database) {
  * Quota shape: GPU-time, not tokens. monthly_token_budget reflects rough
  * Free-tier "session" capacity rather than a hard token cap.
  */
-function migrateModelsV10(db: Database.Database) {
+function migrateModelsV10(db: Db) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1017,13 +1068,13 @@ function migrateModelsV10(db: Database.Database) {
  *    please pay with fiat or send tao". The "free" tier requires a paid
  *    balance, which conflicts with the no-card criterion.
  */
-function migrateModelsV11(db: Database.Database) {
+function migrateModelsV11(db: Db) {
   // 1) Rename cerebras qwen3-235b → qwen-3-235b-a22b-instruct-2507 if the
   //    old id still exists on this DB. Safe to re-run because of the WHERE.
-  db.prepare(`
+  renameModel(db, 'cerebras', 'qwen3-235b', 'qwen-3-235b-a22b-instruct-2507', (d) => d.prepare(`
     UPDATE models SET model_id = 'qwen-3-235b-a22b-instruct-2507'
      WHERE platform = 'cerebras' AND model_id = 'qwen3-235b'
-  `).run();
+  `).run());
 
   // 2) Re-enable NVIDIA NIM (still has 1,000+ starter credits free-tier).
   db.prepare(`
@@ -1129,7 +1180,7 @@ function migrateModelsV11(db: Database.Database) {
  *   - nvidia/nemotron-3-super-120b-a12b:free  262144 → 1000000
  *   - qwen/qwen3-coder:free                   262144 → 1048576
  */
-function migrateModelsV12(db: Database.Database) {
+function migrateModelsV12(db: Db) {
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
     DELETE FROM fallback_config WHERE model_db_id IN (
@@ -1263,7 +1314,7 @@ function migrateModelsV12(db: Database.Database) {
  *   - github: gpt-5 family + xai/grok-3 both 400 "unavailable_model" on free
  *     tier — keep gpt-4o (V2 verdict still holds).
  */
-function migrateModelsV13(db: Database.Database) {
+function migrateModelsV13(db: Db) {
   // 1) Disables (row kept; can be re-enabled without losing fallback history).
   const disable = db.prepare(`UPDATE models SET enabled = 0 WHERE platform = ? AND model_id = ?`);
   const disables: Array<[string, string]> = [
@@ -1388,7 +1439,7 @@ function migrateModelsV13(db: Database.Database) {
  * Cerebras `gpt-oss-120b` is NOT in the deprecation list and stays enabled
  * as the sole free-tier Cerebras route.
  */
-function migrateModelsV14(db: Database.Database) {
+function migrateModelsV14(db: Db) {
   db.prepare(`
     UPDATE models SET enabled = 0
      WHERE platform = 'cerebras'
@@ -1408,7 +1459,7 @@ function migrateModelsV14(db: Database.Database) {
  * as Chutes — so the provider was reverted. This removes any orphaned row from
  * a DB that already ran the original V15. No-op on DBs that never had it.
  */
-function migrateModelsV15(db: Database.Database) {
+function migrateModelsV15(db: Db) {
   db.prepare(`
     DELETE FROM fallback_config WHERE model_db_id IN (
       SELECT id FROM models WHERE platform = 'siliconflow'
@@ -1429,7 +1480,7 @@ function migrateModelsV15(db: Database.Database) {
 // Conservative on purpose: with hard-fail routing a false negative is just a
 // clear "no vision model" error, while a false positive routes an image to a
 // model that chokes. Idempotent — safe on fresh seeds and upgrades alike.
-function migrateModelsV16Vision(db: Database.Database) {
+function migrateModelsV16Vision(db: Db) {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'supports_vision')) {
     db.prepare('ALTER TABLE models ADD COLUMN supports_vision INTEGER NOT NULL DEFAULT 0').run();
@@ -1483,7 +1534,7 @@ function migrateModelsV16Vision(db: Database.Database) {
 // Baidu CoBuddy, Groq Compound, GLM-4.6V Flash, GLM-4.5 Flash, Mistral Small 4,
 // Devstral). intelligence_rank (the within-tier tiebreak, low impact) is left
 // untouched. Idempotent — every statement is an absolute SET, safe to re-run.
-function migrateModelsV17IntelligenceTiers(db: Database.Database) {
+function migrateModelsV17IntelligenceTiers(db: Db) {
   const apply = db.transaction(() => {
     // Frontier (AA ≥ 45): genuine frontier-class. Promotes Gemini 3.5 Flash (55)
     // and Gemini 3 Flash Preview (46) up from Large.
@@ -1587,7 +1638,7 @@ function migrateModelsV17IntelligenceTiers(db: Database.Database) {
 // models (NVIDIA logs Nemotron traffic). Conservative shared 20 RPM / 200 RPD,
 // matching the OpenRouter :free pool pattern. Idempotent (INSERT OR IGNORE +
 // fallback_config backfill), safe to re-run.
-function migrateModelsV18OpenCodeZen(db: Database.Database) {
+function migrateModelsV18OpenCodeZen(db: Db) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1624,7 +1675,7 @@ function migrateModelsV18OpenCodeZen(db: Database.Database) {
  * Dec 2025, so rpd/tpm are conservative. Idempotent (INSERT OR IGNORE + fallback
  * backfill), safe to re-run.
  */
-function migrateModelsV19Gemma4(db: Database.Database) {
+function migrateModelsV19Gemma4(db: Db) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1653,7 +1704,7 @@ function migrateModelsV19Gemma4(db: Database.Database) {
  * 'kilo' api_keys sentinel row, added via the keyless Keys-page flow. Idempotent
  * (INSERT OR IGNORE + fallback backfill), safe to re-run.
  */
-function migrateModelsV20KiloFree(db: Database.Database) {
+function migrateModelsV20KiloFree(db: Db) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1690,7 +1741,7 @@ function migrateModelsV20KiloFree(db: Database.Database) {
  * These ids are re-inserted by their original migrations on each boot, so this
  * later DELETE is what keeps them out. Idempotent, safe to re-run.
  */
-function migrateModelsV21PruneDead(db: Database.Database) {
+function migrateModelsV21PruneDead(db: Db) {
   const dead: Array<[string, string]> = [
     ['llm7', 'gpt-oss-20b'],
     ['llm7', 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo'],
@@ -1745,7 +1796,7 @@ function migrateModelsV21PruneDead(db: Database.Database) {
 // tail (granite, lfm, stepfun, big-pickle, mimo, owl-alpha, cogito,
 // pollinations). Idempotent — reset-then-set, safe on fresh seeds and
 // upgrades alike.
-function migrateModelsV22Tools(db: Database.Database) {
+function migrateModelsV22Tools(db: Db) {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'supports_tools')) {
     db.prepare('ALTER TABLE models ADD COLUMN supports_tools INTEGER NOT NULL DEFAULT 0').run();
@@ -1836,7 +1887,7 @@ function migrateModelsV22Tools(db: Database.Database) {
  * vision/tools seeds match the V16/V22 rules (which re-assert next boot);
  * tiers match V17's bands.
  */
-function migrateModelsV23FreeTierAudit(db: Database.Database) {
+function migrateModelsV23FreeTierAudit(db: Db) {
   const apply = db.transaction(() => {
     for (const platform of ['sambanova', 'chutes']) {
       db.prepare(`
@@ -1896,7 +1947,7 @@ function migrateModelsV23FreeTierAudit(db: Database.Database) {
  *
  * Idempotent: INSERT OR IGNORE + always-run UPDATEs, safe to re-run.
  */
-function migrateModelsV24ZenRefresh(db: Database.Database) {
+function migrateModelsV24ZenRefresh(db: Db) {
   const apply = db.transaction(() => {
     const insert = db.prepare(`
       INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, supports_vision, supports_tools)
@@ -1933,7 +1984,7 @@ function migrateModelsV24ZenRefresh(db: Database.Database) {
  * promo can re-enable). Idempotent: re-asserted each boot like the V13/V24
  * disables.
  */
-function migrateModelsV25ZenDeadPromos(db: Database.Database) {
+function migrateModelsV25ZenDeadPromos(db: Db) {
   const disable = db.prepare(`UPDATE models SET enabled = 0 WHERE platform = ? AND model_id = ?`);
   const disables: Array<[string, string]> = [
     ['opencode', 'nemotron-3-super-free'],
@@ -1961,7 +2012,7 @@ function migrateModelsV25ZenDeadPromos(db: Database.Database) {
 // incompatible spaces, so /v1/embeddings only ever fails over WITHIN a family
 // (same model served by another provider), never across families.
 // Every entry was live-verified against the provider on 2026-06-04.
-function migrateEmbeddingsV1(db: Database.Database) {
+function migrateEmbeddingsV1(db: Db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS embedding_models (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2029,7 +2080,7 @@ function migrateEmbeddingsV1(db: Database.Database) {
  * request_type column (added by migrateEmbeddingsV1) tags media traffic 'image'
  * / 'audio' so it stays out of the chat budget math.
  */
-function migrateMediaV1(db: Database.Database) {
+function migrateMediaV1(db: Db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS media_models (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2071,7 +2122,7 @@ function migrateMediaV1(db: Database.Database) {
  * reset-then-insert of the curated set, so editing a seeded quirk in code wins
  * on next boot while operator-added quirks (new slugs) are left untouched.
  */
-function migrateQuirksV1(db: Database.Database) {
+function migrateQuirksV1(db: Db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS quirks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2113,7 +2164,7 @@ function migrateQuirksV1(db: Database.Database) {
       title: 'No API key required',
       body: 'Routes anonymously — the catalog ships a keyless sentinel row and calls work with no account or key.',
       severity: 'info',
-      targets: [{ platform: 'kilo' }, { platform: 'llm7' }, { platform: 'pollinations' }, { platform: 'ovh' }],
+      targets: [{ platform: 'kilo' }, { platform: 'llm7' }, { platform: 'ovh' }],
     },
     {
       slug: 'ovh-anon-trickle',
@@ -2124,8 +2175,8 @@ function migrateQuirksV1(db: Database.Database) {
     },
     {
       slug: 'pollinations-degraded',
-      title: 'Anon tier degraded (1 concurrent)',
-      body: 'Pollinations’ legacy text API is deprecated for authenticated users (replacement enter.pollinations.ai is pay-as-you-go), but anonymous access is explicitly unaffected. Anon is queue-limited to 1 concurrent request per IP and serves a single model (openai-fast); expect 429 "Queue full" under any parallelism. Live-probed 2026-06-10.',
+      title: 'Publishable key uses recurring shared capacity',
+      body: 'Pollinations chat uses https://gen.pollinations.ai/v1 with a free publishable API key. Shared free capacity currently accrues at one pollen per IP per hour; the legacy text host is no longer used.',
       severity: 'warning',
       targets: [{ platform: 'pollinations' }],
     },
@@ -2222,7 +2273,7 @@ function migrateQuirksV1(db: Database.Database) {
 
 /** Append any models not yet in the fallback chain, lowest priority, ordered by
  * intelligence_rank. Shared by the recent model migrations (V18–V20). */
-function backfillFallback(db: Database.Database) {
+function backfillFallback(db: Db) {
   const missing = db.prepare(`
     SELECT m.id FROM models m
     LEFT JOIN fallback_config f ON m.id = f.model_db_id
@@ -2235,20 +2286,39 @@ function backfillFallback(db: Database.Database) {
   }
 }
 
-function ensureUnifiedKey(db: Database.Database) {
+function ensureUnifiedKey(db: Db) {
   const existing = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
   if (!existing) {
     const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
     db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
-    console.log(`\n  Your unified API key: ${key}\n`);
+    // A direct stdout write bypasses the process-wide console redaction, so it
+    // is only safe for a deliberate local-development session with an attached
+    // terminal. Production, CI, and container startup must never put this
+    // credential in a log stream; the dashboard is the safe retrieval path.
+    if (isInteractiveLocalDevelopment()) {
+      process.stdout.write(`\n  Your unified API key: ${key}\n\n`);
+    } else {
+      console.log(
+        '\n  A unified API key was generated. Open the dashboard and retrieve it from the Keys page.\n' +
+        '  The key is intentionally not printed to logs.\n',
+      );
+    }
   }
+}
+
+function isInteractiveLocalDevelopment(): boolean {
+  const nodeEnv = process.env.NODE_ENV?.trim().toLowerCase() || 'development';
+  return nodeEnv === 'development'
+    && process.stdout.isTTY === true
+    && !process.env.CI
+    && !process.env.KUBERNETES_SERVICE_HOST;
 }
 
 /**
  * Migration helper to ensure Default profile exists, legacy profiles converted, 
  * and fallback_config synced.
  */
-function migrateProfilesInit(db: Database.Database) {
+function migrateProfilesInit(db: Db) {
   // 1. Convert any legacy built-in profiles to custom profiles (type = 'custom')
   db.prepare(`
     UPDATE profiles

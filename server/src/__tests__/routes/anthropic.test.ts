@@ -2,6 +2,10 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vite
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
+import { addToActiveChain } from '../helpers/chain.js';
+import { encrypt } from '../../lib/crypto.js';
+import { setUnifyEnabled, setUnifyOverrides } from '../../services/model-groups.js';
+import { getRoutingStrategy, setRoutingStrategy, type RoutingStrategy } from '../../services/router.js';
 import { mintDashboardToken } from '../helpers/auth.js';
 
 // Anthropic-compatible Messages API (`POST /v1/messages`). These tests drive
@@ -13,7 +17,8 @@ import { mintDashboardToken } from '../helpers/auth.js';
 let dashToken = '';
 
 async function request(app: Express, path: string, body: any, extraHeaders: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
@@ -28,7 +33,8 @@ async function request(app: Express, path: string, body: any, extraHeaders: Reco
 }
 
 async function send(app: Express, method: string, path: string, body?: any, extraHeaders: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method,
@@ -80,6 +86,22 @@ function mockJson(response: any) {
   return captured;
 }
 
+function mockGoogleJsonSequence(responses: any[]) {
+  const origFetch = global.fetch;
+  const capturedBodies: any[] = [];
+  vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+    const urlStr = typeof url === 'string' ? url : url.toString();
+    if (urlStr.includes('generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent')) {
+      capturedBodies.push(JSON.parse(String((init as RequestInit).body)));
+      const response = responses.shift();
+      if (!response) throw new Error('No mocked Google response left');
+      return { ok: true, json: () => Promise.resolve(response) } as any;
+    }
+    return origFetch(url as any, init);
+  });
+  return capturedBodies;
+}
+
 // Mock Groq's streaming upstream with a raw SSE body.
 function mockStream(body: string) {
   const origFetch = global.fetch;
@@ -127,6 +149,11 @@ describe('Anthropic-compatible /v1/messages', () => {
     db.prepare('DELETE FROM rate_limit_cooldowns').run();
     db.prepare('DELETE FROM rate_limit_usage').run();
     db.prepare("DELETE FROM settings WHERE key = 'anthropic_model_map'").run();
+    db.prepare(`
+      INSERT INTO settings (key, value)
+      VALUES ('expose_cc_discovery_aliases', '0')
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run();
     const { status } = await request(app, '/api/keys',
       { platform: 'groq', key: 'gsk_anthropic_test', label: 't' },
       { Authorization: `Bearer ${dashToken}` });
@@ -160,6 +187,28 @@ describe('Anthropic-compatible /v1/messages', () => {
     expect(body.usage).toEqual({ input_tokens: 11, output_tokens: 7 });
     expect(body.id).toMatch(/^msg_/);
     expect(headers.get('x-routed-via')).toMatch(/^groq\//);
+  });
+
+  it('forwards tool_choice.disable_parallel_tool_use as parallel_tool_calls: false', async () => {
+    let captured = mockJson(toolCompletion('get_weather', '{"city":"Karachi"}'));
+    await request(app, '/v1/messages', {
+      model: 'claude-opus-4-1', max_tokens: 128,
+      messages: [{ role: 'user', content: 'weather in Karachi?' }],
+      tools: [WEATHER_TOOL],
+      tool_choice: { type: 'auto', disable_parallel_tool_use: true },
+    }, anthropicHeaders());
+    expect(captured.body.tool_choice).toBe('auto');
+    expect(captured.body.parallel_tool_calls).toBe(false);
+
+    vi.restoreAllMocks();
+    captured = mockJson(toolCompletion('get_weather', '{"city":"Karachi"}'));
+    await request(app, '/v1/messages', {
+      model: 'claude-opus-4-1', max_tokens: 128,
+      messages: [{ role: 'user', content: 'weather in Karachi?' }],
+      tools: [WEATHER_TOOL],
+      tool_choice: { type: 'any' },
+    }, anthropicHeaders());
+    expect(captured.body).not.toHaveProperty('parallel_tool_calls');
   });
 
   it('forwards the system prompt and tools, returns a tool_use block (stop_reason tool_use)', async () => {
@@ -205,6 +254,71 @@ describe('Anthropic-compatible /v1/messages', () => {
     const toolMsg = msgs.find((m: any) => m.role === 'tool');
     expect(toolMsg).toMatchObject({ role: 'tool', tool_call_id: 'toolu_abc', content: 'Sunny, 35C' });
     expect(body.content[0]).toEqual({ type: 'text', text: 'It is sunny and 35C in Karachi.' });
+  });
+
+  it('preserves Gemini thought_signature across an Anthropic tool loop (#487)', async () => {
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+    const addGoogle = await request(app, '/api/keys',
+      { platform: 'google', key: 'google_anthropic_thought_signature_test', label: 'g' },
+      { Authorization: `Bearer ${dashToken}` });
+    expect(addGoogle.status).toBe(201);
+
+    const capturedBodies = mockGoogleJsonSequence([
+      {
+        candidates: [{
+          content: {
+            parts: [{
+              thoughtSignature: 'sig_gemini_tool_1',
+              functionCall: {
+                id: 'call_gemini_1',
+                name: 'get_weather',
+                args: { city: 'Dublin' },
+              },
+            }],
+          },
+          finishReason: 'STOP',
+        }],
+        usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 4, totalTokenCount: 16 },
+      },
+      {
+        candidates: [{ content: { parts: [{ text: 'Rainy, 12C.' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 18, candidatesTokenCount: 5, totalTokenCount: 23 },
+      },
+    ]);
+
+    const first = await request(app, '/v1/messages', {
+      model: 'gemini-3.5-flash', max_tokens: 128,
+      messages: [{ role: 'user', content: 'weather in Dublin?' }],
+      tools: [WEATHER_TOOL],
+    }, anthropicHeaders());
+
+    expect(first.status).toBe(200);
+    const toolUse = first.body.content.find((b: any) => b.type === 'tool_use');
+    expect(toolUse).toMatchObject({
+      id: 'call_gemini_1',
+      name: 'get_weather',
+      input: { city: 'Dublin' },
+      thought_signature: 'sig_gemini_tool_1',
+    });
+
+    const second = await request(app, '/v1/messages', {
+      model: 'gemini-3.5-flash', max_tokens: 128,
+      messages: [
+        { role: 'user', content: 'weather in Dublin?' },
+        { role: 'assistant', content: [toolUse] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUse.id, content: '{"temp":12,"condition":"rain"}' }] },
+      ],
+      tools: [WEATHER_TOOL],
+    }, anthropicHeaders());
+
+    expect(second.status).toBe(200);
+    expect(second.body.content).toEqual([{ type: 'text', text: 'Rainy, 12C.' }]);
+    const assistantEntry = capturedBodies[1].contents.find((c: any) => c.role === 'model');
+    expect(assistantEntry.parts[0]).toMatchObject({
+      thoughtSignature: 'sig_gemini_tool_1',
+      functionCall: { id: 'call_gemini_1', name: 'get_weather' },
+    });
   });
 
   it('accepts an Anthropic image block and forwards it as an image_url block', async () => {
@@ -262,6 +376,48 @@ describe('Anthropic-compatible /v1/messages', () => {
     expect(msgDelta!.data.delta.stop_reason).toBe('end_turn');
   });
 
+  it('reports the upstream token usage in the streamed message_delta', async () => {
+    const chunk = (delta: any, finish: string | null = null) => ({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] });
+    // Usage on its own choice-less frame (OpenAI include_usage shape).
+    mockStream(sse(
+      chunk({ role: 'assistant' }),
+      chunk({ content: 'Hello world' }, 'stop'),
+      { id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [], usage: { prompt_tokens: 1234, completion_tokens: 56, total_tokens: 1290 } },
+      '[DONE]',
+    ));
+    let { text } = await request(app, '/v1/messages', {
+      model: 'claude-sonnet-4-5', max_tokens: 64, stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, anthropicHeaders());
+    let msgDelta = sseEvents(text).find(e => e.event === 'message_delta');
+    expect(msgDelta!.data.usage).toEqual({ input_tokens: 1234, output_tokens: 56 });
+
+    // Usage bundled onto the last choice frame.
+    vi.restoreAllMocks();
+    mockStream(sse(
+      chunk({ role: 'assistant' }),
+      { ...chunk({ content: 'Hi' }, 'stop'), usage: { prompt_tokens: 40, completion_tokens: 3, total_tokens: 43 } },
+      '[DONE]',
+    ));
+    ({ text } = await request(app, '/v1/messages', {
+      model: 'claude-sonnet-4-5', max_tokens: 64, stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, anthropicHeaders()));
+    msgDelta = sseEvents(text).find(e => e.event === 'message_delta');
+    expect(msgDelta!.data.usage).toEqual({ input_tokens: 40, output_tokens: 3 });
+  });
+
+  it('keeps the estimated usage when the upstream stream reports none', async () => {
+    const chunk = (delta: any, finish: string | null = null) => ({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] });
+    mockStream(sse(chunk({ role: 'assistant' }), chunk({ content: 'Hello world' }, 'stop'), '[DONE]'));
+    const { text } = await request(app, '/v1/messages', {
+      model: 'claude-sonnet-4-5', max_tokens: 64, stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, anthropicHeaders());
+    const msgDelta = sseEvents(text).find(e => e.event === 'message_delta');
+    expect(msgDelta!.data.usage).toEqual({ output_tokens: 3 });
+  });
+
   it('streams a buffered tool_use block (stop_reason tool_use)', async () => {
     const chunk = (delta: any, finish: string | null = null) => ({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] });
     mockStream(sse(
@@ -296,6 +452,17 @@ describe('Anthropic-compatible /v1/messages', () => {
     }, anthropicHeaders());
     expect(status).toBe(200);
     expect(body.input_tokens).toBeGreaterThan(0);
+  });
+
+  it('counts tool schemas in /v1/messages/count_tokens', async () => {
+    const messages = [{ role: 'user', content: 'count these tokens please' }];
+    const bare = await request(app, '/v1/messages/count_tokens', { model: 'claude-sonnet-4-5', messages }, anthropicHeaders());
+    const withTools = await request(app, '/v1/messages/count_tokens', {
+      model: 'claude-sonnet-4-5',
+      messages,
+      tools: [{ name: 'Read', description: 'r'.repeat(4000), input_schema: { type: 'object', properties: {} } }],
+    }, anthropicHeaders());
+    expect(withTools.body.input_tokens).toBeGreaterThan(bare.body.input_tokens + 1000);
   });
 
   it('returns an Anthropic invalid_request_error on a malformed body', async () => {
@@ -336,6 +503,57 @@ describe('Anthropic-compatible /v1/messages', () => {
     }
   });
 
+  // #880: Claude Desktop fetched the whole catalog over HTTP 200 and still
+  // reported "found 0 models", because it only accepts Claude-family ids. The
+  // listing now carries one id per family, and each one routes.
+  it('GET /v1/models lists a Claude-family id that /v1/messages then serves', async () => {
+    const { body } = await send(app, 'GET', '/v1/models', undefined, anthropicHeaders());
+    const sonnet = body.data.find((m: any) => m.id === 'claude-sonnet-4-5');
+    expect(sonnet).toBeTruthy();
+    expect(sonnet.type).toBe('model');
+    // The label must not read as hosted Claude.
+    expect(sonnet.display_name).toContain('Sonnet slot');
+    for (const id of ['claude-opus-4-5', 'claude-haiku-4-5']) {
+      expect(body.data.some((m: any) => m.id === id)).toBe(true);
+    }
+
+    // The whole point: a client that picks a discovered id gets a real answer.
+    const captured = mockJson(textCompletion('family slot routed'));
+    const response = await request(app, '/v1/messages', {
+      model: sonnet.id, max_tokens: 32, messages: [{ role: 'user', content: 'hello' }],
+    }, anthropicHeaders());
+    expect(response.status).toBe(200);
+    expect(captured.body).toBeTruthy();
+  });
+
+  it('gates Claude Code discovery aliases and routes a selected alias', async () => {
+    const hidden = await send(app, 'GET', '/v1/models', undefined, anthropicHeaders());
+    expect(hidden.body.data.some((model: any) => model.id.startsWith('claude/'))).toBe(false);
+
+    const enabled = await send(
+      app,
+      'PUT',
+      '/api/settings/agent-compatibility',
+      { exposeClaudeDiscoveryAliases: true },
+      { Authorization: `Bearer ${dashToken}` },
+    );
+    expect(enabled.status).toBe(200);
+
+    const discovered = await send(app, 'GET', '/v1/models', undefined, anthropicHeaders());
+    const alias = discovered.body.data.find((model: any) => model.id.startsWith('claude/'));
+    expect(alias).toBeTruthy();
+
+    const captured = mockJson(textCompletion('alias routed'));
+    const response = await request(app, '/v1/messages', {
+      model: alias.id,
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'hello' }],
+    }, anthropicHeaders());
+    expect(response.status).toBe(200);
+    expect(response.body.model).toBe(alias.id);
+    expect(captured.body.model).not.toContain('claude/');
+  });
+
   it('GET /v1/models falls through to the OpenAI shape without anthropic-version', async () => {
     const { status, body } = await send(app, 'GET', '/v1/models', undefined, { Authorization: `Bearer ${getUnifiedApiKey()}` });
     expect(status).toBe(200);
@@ -369,4 +587,151 @@ describe('Anthropic-compatible /v1/messages', () => {
     expect(status).toBe(200);
     expect(body.map).toEqual({ default: 'auto', opus: 'auto', sonnet: 'auto', haiku: 'auto' });
   });
+
+  // ── Same-model cross-provider failover (#932) ────────────────────────────
+  // Reported by stephenzwj: a pinned /v1/messages request preferred exactly ONE
+  // catalog row, so when that provider rate-limited, the fallback loop walked
+  // the rest of the chain and answered with a DIFFERENT model. Every other
+  // surface already routes a pinned id over its unified model group as a strict
+  // chain; these tests hold /v1/messages to the same contract.
+  describe('same-model cross-provider failover (#932)', () => {
+    const SHARED = 'shared-fallback-model';
+    const UNRELATED = 'unrelated-test-model';
+    let enabledBefore: number[] = [];
+    let addedIds: number[] = [];
+    let strategyBefore: RoutingStrategy;
+
+    // A catalog row + its fallback_config entry, returning the model db id.
+    function addModel(platform: string, modelId: string, displayName: string, priority: number): number {
+      const db = getDb();
+      const info = db.prepare(`
+        INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+                            rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, supports_vision)
+        VALUES (?, ?, ?, 5, 5, 'Large', 100, NULL, NULL, NULL, '~10M', 131072, 1, 0)
+      `).run(platform, modelId, displayName);
+      const id = Number(info.lastInsertRowid);
+      db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(id, priority);
+      addToActiveChain(id, priority);
+      return id;
+    }
+
+    function addKey(platform: string): void {
+      const { encrypted, iv, authTag } = encrypt(`test-key-${platform}`);
+      getDb().prepare(`
+        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+        VALUES (?, ?, ?, ?, ?, 'healthy', 1)
+      `).run(platform, `${platform}-key`, encrypted, iv, authTag);
+    }
+
+    beforeEach(() => {
+      const db = getDb();
+      strategyBefore = getRoutingStrategy();
+      setRoutingStrategy('priority');
+      setUnifyEnabled(true);
+      setUnifyOverrides({ merges: [], splits: [] });
+      // Isolate the catalog: only the three rows below can be routed to, so
+      // "served by an unrelated model" is unambiguous.
+      enabledBefore = (db.prepare('SELECT id FROM models WHERE enabled = 1').all() as { id: number }[]).map(r => r.id);
+      db.prepare('UPDATE models SET enabled = 0').run();
+      addedIds = [
+        // The SAME model_id served by two platforms. Groq is tried first
+        // (priority 10 < 20) and is the one that fails.
+        addModel('groq', SHARED, 'Shared Fallback Model', 10),
+        addModel('cerebras', SHARED, 'Shared Fallback Model', 20),
+        // A different model on the healthy platform, with the BEST priority in
+        // the catalog — before the fix this is what answered the request.
+        addModel('cerebras', UNRELATED, 'Unrelated Test Model', 1),
+      ];
+      addKey('cerebras'); // the groq key is created by the outer beforeEach
+    });
+
+    afterEach(() => {
+      const db = getDb();
+      for (const id of addedIds) {
+        db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(id);
+        db.prepare('DELETE FROM models WHERE id = ?').run(id);
+      }
+      if (enabledBefore.length) {
+        db.prepare(`UPDATE models SET enabled = 1 WHERE id IN (${enabledBefore.map(() => '?').join(',')})`).run(...enabledBefore);
+      }
+      setRoutingStrategy(strategyBefore);
+    });
+
+    // Records every upstream the router actually dispatched to, as
+    // "platform/model_id", and rate-limits Groq.
+    function mockTwoPlatforms(seen: string[]) {
+      const orig = global.fetch;
+      vi.spyOn(global, 'fetch').mockImplementation(async (url: any, init?: any) => {
+        const u = String(url);
+        const sent = init?.body ? JSON.parse(String(init.body)) : {};
+        if (u.includes('api.groq.com')) {
+          seen.push(`groq/${sent.model}`);
+          return new Response(JSON.stringify({ error: { message: 'rate limited' } }), { status: 429 });
+        }
+        if (u.includes('api.cerebras.ai')) {
+          seen.push(`cerebras/${sent.model}`);
+          return new Response(JSON.stringify({
+            id: 'chatcmpl-c', object: 'chat.completion', created: 1, model: sent.model,
+            choices: [{ index: 0, message: { role: 'assistant', content: `answer from cerebras ${sent.model}` }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return orig(url, init);
+      });
+    }
+
+    it('falls over to the SAME model on the second provider, never to an unrelated one', async () => {
+      const seen: string[] = [];
+      mockTwoPlatforms(seen);
+
+      const { status, body, headers } = await request(app, '/v1/messages', {
+        model: SHARED, max_tokens: 64, messages: [{ role: 'user', content: 'hi' }],
+      }, anthropicHeaders());
+
+      expect(status).toBe(200);
+      // Same model, second provider — not the better-priority unrelated model.
+      expect(headers.get('x-routed-via')).toBe(`cerebras/${SHARED}`);
+      expect(body.content[0].text).toBe(`answer from cerebras ${SHARED}`);
+      expect(seen).toEqual([`groq/${SHARED}`, `cerebras/${SHARED}`]);
+      expect(seen.some(s => s.includes(UNRELATED))).toBe(false);
+    });
+
+    it('never leaves the pinned model even when every provider for it fails', async () => {
+      const orig = global.fetch;
+      const seen: string[] = [];
+      vi.spyOn(global, 'fetch').mockImplementation(async (url: any, init?: any) => {
+        const u = String(url);
+        const sent = init?.body ? JSON.parse(String(init.body)) : {};
+        if (u.includes('api.groq.com') || u.includes('api.cerebras.ai')) {
+          seen.push(`${u.includes('api.groq.com') ? 'groq' : 'cerebras'}/${sent.model}`);
+          return new Response(JSON.stringify({ error: { message: 'rate limited' } }), { status: 429 });
+        }
+        return orig(url, init);
+      });
+
+      const { status } = await request(app, '/v1/messages', {
+        model: SHARED, max_tokens: 64, messages: [{ role: 'user', content: 'hi' }],
+      }, anthropicHeaders());
+
+      expect(status).toBeGreaterThanOrEqual(400);
+      expect(seen.every(s => s.endsWith(`/${SHARED}`))).toBe(true);
+      expect(seen.some(s => s.includes(UNRELATED))).toBe(false);
+    });
+
+    it('leaves an auto-routed Claude alias on the full chain', async () => {
+      // opus/sonnet/haiku/default all map to 'auto' by default, so nothing is
+      // pinned and the router is free to pick any model — including the
+      // unrelated one, which is exactly the pre-existing behaviour.
+      const seen: string[] = [];
+      mockTwoPlatforms(seen);
+
+      const { status, headers } = await request(app, '/v1/messages', {
+        model: 'claude-sonnet-4-5', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }],
+      }, anthropicHeaders());
+
+      expect(status).toBe(200);
+      expect(headers.get('x-routed-via')).toBe(`cerebras/${UNRELATED}`);
+    });
+  });
+
 });

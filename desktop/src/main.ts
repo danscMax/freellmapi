@@ -1,12 +1,16 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { app, dialog, ipcMain, clipboard, nativeTheme, shell } from 'electron';
-import { startServer, ensureSessionToken, getUnifiedApiKey } from './server.mjs';
+import { app, dialog, ipcMain, clipboard, nativeTheme, net, screen, shell, type Tray } from 'electron';
+import { startServer, ensureSessionToken, getUnifiedApiKey, isAutoUpdateCheckEnabled, backupBeforeUpdate, outboundProxyUrl, setCatalogFallbackFetch } from './server.mjs';
 import { loadConfig, saveConfig } from './config.js';
+import { installFileLogger } from './logger.js';
 import { buildTray, refreshTrayLocale } from './tray.js';
+import { trayIsInMenuBar } from './tray-visibility.js';
+import { shouldOpenDashboardOnLaunch } from './tray-platform.js';
 import { openDashboard } from './window.js';
 import { todayStats, hourlyRequests, successRateToday } from './stats.js';
 import { normalizeLocale, nativeStrings, type NativeLocale } from './i18n.js';
+import { initUpdater, getUpdateState, checkForUpdates, downloadUpdate, installUpdate, checkFromTray } from './updater.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PORT = 31415;
@@ -20,17 +24,36 @@ app.setPath('userData', path.join(app.getPath('appData'), 'FreeLLMAPI'));
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
+  // Before anything else can print: a packaged app has no attached stdout, so
+  // without this the server's console output — the password-reset code above
+  // all (#824) — is written nowhere the user can read it.
+  installFileLogger();
+
   let resolvedPort = DEFAULT_PORT;
   let sessionToken = '';
-  // The dashboard owns the theme (its navbar toggle); the popover and the
-  // window vibrancy follow. Last choice persists in config; before the
-  // dashboard has ever reported, fall back to the system appearance —
-  // matching the dashboard's own prefers-color-scheme default.
-  let theme: 'dark' | 'light' =
-    (process.env.FREEAPI_THEME as 'dark' | 'light' | undefined) // dev-only screenshot override
+  // The dashboard owns the theme (its Settings dialog); the popover and the
+  // window vibrancy follow. The persisted choice may be 'system', in which
+  // case themeSource is handed back to the OS so the dashboard's
+  // prefers-color-scheme tracks live appearance changes; `theme` is always
+  // the resolved dark/light the popover snapshot needs.
+  let themeChoice: 'dark' | 'light' | 'system' =
+    (process.env.FREEAPI_THEME as 'dark' | 'light' | 'system' | undefined) // dev-only screenshot override
     ?? loadConfig().theme
-    ?? (nativeTheme.shouldUseDarkColors ? 'dark' : 'light');
-  nativeTheme.themeSource = theme;
+    ?? 'system';
+  nativeTheme.themeSource = themeChoice;
+  let theme: 'dark' | 'light' = themeChoice === 'system'
+    ? (nativeTheme.shouldUseDarkColors ? 'dark' : 'light')
+    : themeChoice;
+  // With a 'system' choice the OS can flip appearance while the dashboard
+  // window (and its reporting preload) is closed — track it here too.
+  nativeTheme.on('updated', async () => {
+    if (themeChoice !== 'system') return;
+    const next = nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
+    if (next === theme) return;
+    theme = next;
+    const { getPopoverWindow } = await import('./popover.js');
+    getPopoverWindow()?.webContents.send('freeapi:refresh');
+  });
   // The dashboard also owns the language (its ⋯-menu selector); the native tray
   // menu and popover follow via the same mirror-and-persist pattern as the theme.
   let locale: NativeLocale = normalizeLocale(
@@ -38,6 +61,15 @@ if (!app.requestSingleInstanceLock()) {
   );
 
   app.on('second-instance', () => {
+    if (sessionToken) openDashboard(resolvedPort, sessionToken);
+  });
+
+  // Reopening a *running* app on macOS — double-clicking it in Finder, clicking
+  // its Dock icon — is delivered as 'activate'. LaunchServices activates the
+  // live process instead of starting a second one, so 'second-instance' above
+  // never fires for it. Without this handler a user whose tray icon is hidden
+  // or clipped by the menu bar has no way back into the UI at all (#807).
+  app.on('activate', () => {
     if (sessionToken) openDashboard(resolvedPort, sessionToken);
   });
 
@@ -90,13 +122,20 @@ if (!app.requestSingleInstanceLock()) {
       strings: nativeStrings(locale),
     };
   });
-  ipcMain.on('freeapi:theme-changed', async (_e, next: 'dark' | 'light') => {
-    if (next !== 'dark' && next !== 'light') return;
-    if (next === theme) return;
-    theme = next;
-    saveConfig({ ...loadConfig(), theme });
-    // Flips the vibrancy materials (popover glass + dashboard backdrop).
-    nativeTheme.themeSource = theme;
+  ipcMain.on('freeapi:theme-changed', async (_e, raw: unknown) => {
+    // Older preloads sent the bare resolved string; current ones send
+    // { resolved, choice } so a 'system' choice can reach nativeTheme.
+    const payload = typeof raw === 'string' ? { resolved: raw } : (raw ?? {}) as { resolved?: unknown; choice?: unknown };
+    const resolved = payload.resolved;
+    if (resolved !== 'dark' && resolved !== 'light') return;
+    const choice: 'dark' | 'light' | 'system' = payload.choice === 'system' ? 'system' : resolved;
+    if (resolved === theme && choice === themeChoice) return;
+    theme = resolved;
+    themeChoice = choice;
+    saveConfig({ ...loadConfig(), theme: themeChoice });
+    // Flips the vibrancy materials (popover glass + dashboard backdrop);
+    // 'system' delegates to the OS appearance.
+    nativeTheme.themeSource = themeChoice;
     const { getPopoverWindow } = await import('./popover.js');
     getPopoverWindow()?.webContents.send('freeapi:refresh');
   });
@@ -115,6 +154,20 @@ if (!app.requestSingleInstanceLock()) {
   ipcMain.handle('freeapi:copy-api-key', () => clipboard.writeText(getUnifiedApiKey()));
   ipcMain.handle('freeapi:set-login-item', (_e, open: boolean) => app.setLoginItemSettings({ openAtLogin: open }));
   ipcMain.handle('freeapi:quit', () => app.quit());
+  // Dashboard → the in-app updater (preload __FREEAPI_UPDATER__). Each call
+  // returns the new state; progress arrives as 'freeapi:update-state' events.
+  ipcMain.handle('freeapi:update-state', () => getUpdateState());
+  ipcMain.handle('freeapi:update-check', () => checkForUpdates());
+  ipcMain.handle('freeapi:update-download', () => downloadUpdate());
+  ipcMain.handle('freeapi:update-install', () => installUpdate());
+  // Dashboard → a fresh session for the hidden machine account (preload
+  // __FREEAPI_SESSION__). The window never shows a login form: its account has
+  // a random password nobody knows, so when the boot-time session is gone the
+  // only sane answer is a new one. Later windows reuse it too.
+  ipcMain.handle('freeapi:session-token', () => {
+    sessionToken = ensureSessionToken();
+    return sessionToken;
+  });
 
   // Flip the LAN-access flag and relaunch so the server rebinds (127.0.0.1 ↔
   // 0.0.0.0). Enabling shows a one-time warning: the API becomes reachable by
@@ -144,8 +197,62 @@ if (!app.requestSingleInstanceLock()) {
     app.quit();
   }
 
+  // macOS lays the status item out asynchronously; reading its bounds straight
+  // after `new Tray()` can catch it before it has been placed.
+  const TRAY_PROBE_DELAY_MS = 1500;
+
+  // The app is menu-bar-only, so a tray macOS declines to show leaves it running
+  // with no UI whatsoever — the silent failure behind #807. Say so in the log,
+  // and once per version offer the ways in that do not need the icon.
+  function reportHiddenTray(tray: Tray, port: number): void {
+    let visible: boolean;
+    try {
+      visible = trayIsInMenuBar(tray.getBounds(), screen.getAllDisplays());
+    } catch {
+      return; // a diagnostic must never be the thing that breaks startup
+    }
+    if (visible) return;
+    console.log('[desktop] the menu bar is not showing our tray icon — see #807');
+
+    const cfg = loadConfig();
+    if (cfg.trayHiddenNoticeVersion === app.getVersion()) return;
+    saveConfig({ ...cfg, trayHiddenNoticeVersion: app.getVersion() });
+
+    const choice = dialog.showMessageBoxSync({
+      type: 'info',
+      title: 'FreeLLMAPI has no menu-bar icon',
+      message: 'macOS is not showing the FreeLLMAPI menu-bar icon.',
+      detail:
+        'The app and its API are running normally, but the icon everything else ' +
+        'hangs off is not being drawn, so there is nothing to click.\n\n' +
+        'To bring it back: System Settings > Menu Bar, find FreeLLMAPI and set it ' +
+        'to Allow. On a Mac with a notch, quitting a few other menu-bar apps can ' +
+        'also free up the room it needs.\n\n' +
+        'Until then, relaunching FreeLLMAPI from Finder opens the dashboard.',
+      buttons: ['Open Dashboard', 'Continue in Background'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (choice === 0) openDashboard(port, sessionToken);
+  }
+
+  // The bundle ships LSUIElement, so the app starts as an accessory with no
+  // Dock presence at all; app.dock.show() promotes it at runtime and hide()
+  // puts it back, no relaunch either way.
+  function applyDockVisibility(show: boolean): void {
+    if (process.platform !== 'darwin') return;
+    if (show) void app.dock?.show();
+    else app.dock?.hide();
+  }
+
+  function toggleShowInDock(): void {
+    const next = !(loadConfig().showInDock ?? true);
+    saveConfig({ ...loadConfig(), showInDock: next });
+    applyDockVisibility(next);
+  }
+
   app.whenReady().then(async () => {
-    if (process.platform === 'darwin') app.dock?.hide();
+    applyDockVisibility(loadConfig().showInDock ?? true);
 
     const cfg = loadConfig();
     const dbPath = path.join(app.getPath('userData'), 'freeapi.db');
@@ -163,6 +270,28 @@ if (!app.requestSingleInstanceLock()) {
     // toggle persists the flag and relaunches.
     const host = cfg.lanAccess ? '0.0.0.0' : '127.0.0.1';
 
+    // The bundled server runs in THIS process, so handing it the shell's own
+    // version is both the cheapest and the most authoritative answer for the
+    // dashboard's version row — no manifest lookup, and it cannot disagree with
+    // the app the user actually launched (#703).
+    process.env.FREEAPI_VERSION = app.getVersion();
+
+    initUpdater({
+      autoCheckEnabled: () => {
+        try { return isAutoUpdateCheckEnabled(); } catch { return false; }
+      },
+      backupBeforeUpdate,
+      outboundProxyUrl: () => {
+        try { return outboundProxyUrl(); } catch { return ''; }
+      },
+      getLocale: () => locale,
+    });
+
+    // License activation and catalog sync retry through Chromium's network
+    // stack (OS certificate store + system proxy) when Node's fetch can't
+    // reach api.freellmapi.co, which some Windows PCs hit as "HTTP 502".
+    setCatalogFallbackFetch((input, init) => net.fetch(String(input), init));
+
     try {
       const { port } = await startServer({
         dbPath,
@@ -173,14 +302,46 @@ if (!app.requestSingleInstanceLock()) {
       resolvedPort = port;
       saveConfig({ ...cfg, port });
       sessionToken = ensureSessionToken();
-      const tray = buildTray(port, sessionToken, () => locale, () => loadConfig().lanAccess ?? false, toggleLanAccess);
+      // The server is already up, so a tray that fails to build must not take
+      // the app down with it: fall back to the dashboard window (#1353).
+      let tray: Tray | null = null;
+      try {
+        tray = buildTray(
+          port,
+          sessionToken,
+          () => locale,
+          () => loadConfig().lanAccess ?? false,
+          toggleLanAccess,
+          () => loadConfig().showInDock ?? true,
+          toggleShowInDock,
+          getUpdateState,
+          () => void checkFromTray(),
+        );
+      } catch (err) {
+        console.warn('[desktop] could not create the tray icon:', err);
+      }
       console.log(`[desktop] FreeLLMAPI running on http://${host}:${port}${cfg.lanAccess ? ' (LAN access enabled)' : ''}`);
+      // A tray that macOS refuses to draw still constructs cleanly, so the only
+      // way to notice is to look at where the item landed (#807).
+      if (tray && process.platform === 'darwin') {
+        const built = tray;
+        setTimeout(() => reportHiddenTray(built, port), TRAY_PROBE_DELAY_MS);
+      }
+
+      const welcomedBefore = loadConfig().launchDashboardShown ?? false;
+      if (
+        !process.env.FREEAPI_SHOT
+        && shouldOpenDashboardOnLaunch(process.platform, { trayBuilt: tray !== null, welcomedBefore })
+      ) {
+        openDashboard(port, sessionToken);
+        if (!welcomedBefore) saveConfig({ ...loadConfig(), launchDashboardShown: true });
+      }
 
       // Dev-only UI verification: FREEAPI_SHOT=1 opens the popover and the
       // dashboard, captures both to /tmp, and quits. FREEAPI_SHOT=hold opens
       // the popover and keeps it pinned (blur ignored) so a real screen
       // capture can include the compositor's vibrancy. Never set when packaged.
-      if (process.env.FREEAPI_SHOT && !app.isPackaged) {
+      if (tray && process.env.FREEAPI_SHOT && !app.isPackaged) {
         const fs = await import('node:fs');
         const { togglePopover, getPopoverWindow } = await import('./popover.js');
         const { getDashboardWindow } = await import('./window.js');

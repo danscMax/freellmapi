@@ -48,6 +48,72 @@ describe('CloudflareProvider', () => {
     expect(result.choices[0].message.content).toBe('Hello from CF!');
   });
 
+
+  it('preserves multimodal user image_url blocks', async () => {
+    let capturedBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: async () => ({
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: 'Image received' },
+            finish_reason: 'stop',
+          }],
+        }),
+      } as any;
+    });
+
+    const content = [
+      { type: 'text', text: 'Describe this image' },
+      {
+        type: 'image_url',
+        image_url: { url: 'data:image/png;base64,AA==' },
+      },
+    ];
+
+    await provider.chatCompletion(
+      'test-account:test-token',
+      [{ role: 'user', content } as any],
+      '@cf/qwen/qwen3.8-27b',
+    );
+
+    expect(capturedBody.messages[0].content).toEqual(content);
+  });
+
+  it('preserves image_url in streaming requests', async () => {
+    let capturedBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: false,
+        status: 400,
+        statusText: 'Mock stop',
+        headers: new Headers(),
+        json: async () => ({ error: { message: 'Mock stop' } }),
+      } as any;
+    });
+
+    const content = [
+      { type: 'text', text: 'Describe this image' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+    ];
+
+    await expect(
+      provider.streamChatCompletion(
+        'test-account:test-token',
+        [{ role: 'user', content } as any],
+        '@cf/qwen/qwen3.8-27b',
+      ).next()
+    ).rejects.toThrow();
+
+    expect(capturedBody.stream).toBe(true);
+    expect(capturedBody.messages[0].content).toEqual(content);
+  });
+
   it('should throw if key format is wrong', async () => {
     await expect(
       provider.chatCompletion('no-colon-here', [{ role: 'user', content: 'Hi' }], 'model')
@@ -90,15 +156,23 @@ describe('CloudflareProvider', () => {
       expect(calls[1]).toBe('https://api.cloudflare.com/client/v4/accounts/acc123/tokens/verify');
     });
 
-    it('returns false only when both scopes reject the token', async () => {
+    it('fails with the upstream reason when both scopes reject the token', async () => {
       vi.spyOn(global, 'fetch').mockImplementation(async () => {
-        return { ok: false, status: 403, json: () => Promise.resolve({}) } as any;
+        return {
+          ok: false,
+          status: 403,
+          statusText: 'Forbidden',
+          json: () => Promise.resolve({ success: false, errors: [{ code: 9109, message: 'Invalid access token' }] }),
+        } as any;
       });
 
-      expect(await provider.validateKey('acc123:tok')).toBe(false);
+      const result = await provider.validateKey('acc123:tok');
+      expect(result).toMatchObject({ valid: false });
+      expect((result as any).error).toContain('HTTP 403');
+      expect((result as any).error).toContain('Invalid access token');
     });
 
-    it('returns false when the account scope reports an inactive token', async () => {
+    it('fails with the token status when the account scope reports an inactive token', async () => {
       vi.spyOn(global, 'fetch').mockImplementation(async (url) => {
         if ((url as string).includes('/user/tokens/verify')) {
           return { ok: false, status: 403, json: () => Promise.resolve({}) } as any;
@@ -110,7 +184,9 @@ describe('CloudflareProvider', () => {
         } as any;
       });
 
-      expect(await provider.validateKey('acc123:tok')).toBe(false);
+      const result = await provider.validateKey('acc123:tok');
+      expect(result).toMatchObject({ valid: false });
+      expect((result as any).error).toContain('token status is "disabled"');
     });
   });
 
